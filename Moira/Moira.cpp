@@ -461,28 +461,42 @@ Moira::reset()
 
     SYNC(16);
 
-    // Read the initial (supervisor) stack pointer from memory
-    SYNC(2);
-    reg.sp = read16OnReset(0);
-    SYNC(4);
-    reg.isp = reg.sp = (read16OnReset(2) & ~0x1) | reg.sp << 16;
-    SYNC(4);
-    reg.pc = read16OnReset(4);
-    SYNC(4);
-    reg.pc = (read16OnReset(6) & ~0x1) | reg.pc << 16;
+    // A bus error during the reset sequence is a double bus fault (MC68000UM 5.4.4,
+    // 6.3.9.1, MC68020UM 6.1.1, MC68030UM 8.1.1, MC68040UM 8.2.10)
+    bool doubleFault = false;
 
-    // Fill the prefetch queue
-    SYNC(4);
-    queue.irc = read16OnReset(reg.pc & addrMask<C>());
-    SYNC(2);
-    prefetch<C>();
-    reg.pc0 = reg.pc - 2;
+    try {
+
+        // Read the initial (supervisor) stack pointer from memory
+        SYNC(2);
+        reg.sp = read16OnReset(0);
+        SYNC(4);
+        reg.isp = reg.sp = (read16OnReset(2) & ~0x1) | reg.sp << 16;
+        SYNC(4);
+        reg.pc = read16OnReset(4);
+        SYNC(4);
+        reg.pc = (read16OnReset(6) & ~0x1) | reg.pc << 16;
+
+        // Fill the prefetch queue
+        SYNC(4);
+        queue.irc = read16OnReset(reg.pc & addrMask<C>());
+        SYNC(2);
+        prefetch<C>();
+        reg.pc0 = reg.pc - 2;
+
+    } catch (const BusError &) {
+
+        doubleFault = true;
+    }
 
     // Reset subcomponents
     debugger.reset();
 
     // Inform the delegate
     didResetCPU();
+
+    // Halt the CPU after a double bus fault
+    if (doubleFault) halt();
 }
 
 void

@@ -7,6 +7,7 @@
 
 #include "doctest.h"
 #include "Moira.h"
+#include <string>
 #include <vector>
 
 using namespace moira;
@@ -563,6 +564,57 @@ TEST_CASE("An instruction is restarted after a failing prefetch")
         CHECK(cpu.getPC0() == 0x1004);
         cpu.execute();
         CHECK(cpu.getD(1) == 1);
+    }
+}
+
+/* A bus error while the CPU reads the reset vector or fills the prefetch queue
+ * is a double bus fault. The reset completes (the debugger is reset and the
+ * delegate is informed), then the CPU halts until the next reset.
+ */
+class ResetCPU : public TestCPU {
+
+public:
+
+    std::string log;
+
+    ResetCPU(CPUModel model) : TestCPU(model) { }
+
+    void didResetCPU() override { log += isHalted() ? "R(halted)" : "R"; }
+    void didHaltCPU() override { log += "H"; }
+
+    // Indicates whether the debugger checks for breakpoints
+    bool checksBreakpoints() const { return flags & State::CHECK_BP; }
+};
+
+TEST_CASE("A bus error during reset halts the CPU")
+{
+    for (auto model : { CPUModel::M68000, CPUModel::M68010, CPUModel::M68020,
+                        CPUModel::M68030, CPUModel::M68040 }) {
+
+        for (u32 fault : { 0u, 2u, 4u, 6u, TestCPU::codeStart, TestCPU::codeStart + 2 }) {
+
+            CAPTURE(int(model));
+            CAPTURE(fault);
+
+            ResetCPU cpu(model);
+            cpu.poke16(TestCPU::codeStart, 0x4E71);     // NOP
+            cpu.debugger.breakpoints.setAt(0x2000);
+            cpu.faultAddr = fault;
+            cpu.log.clear();
+
+            CHECK_NOTHROW(cpu.reset());
+            CHECK(cpu.isHalted());
+            CHECK(cpu.log == "RH");                     // Reset first, then halt
+            CHECK(cpu.checksBreakpoints());             // The debugger has been reset
+
+            // The next reset leaves the halted state
+            cpu.faultAddr = 0xFFFFFFFF;
+            cpu.reset();
+            CHECK(!cpu.isHalted());
+            CHECK(cpu.getPC0() == TestCPU::codeStart);
+            cpu.execute();
+            CHECK(cpu.getPC0() == TestCPU::codeStart + 2);
+        }
     }
 }
 

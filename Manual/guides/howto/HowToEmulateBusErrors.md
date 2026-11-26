@@ -88,7 +88,7 @@ What happens when the handler returns with `RTE` depends on the model:
 
 ## Double Bus Faults
 
-If another bus error occurs while the CPU is processing a bus error, for example because the stack pointer points to unmapped memory, the CPU enters the halted state. Moira calls the `didHaltCPU()` delegate, and `isHalted()` returns true. While halted, `execute()` only advances the clock. Only `reset()` leaves this state.
+If another bus error occurs while the CPU is processing a bus error, for example because the stack pointer points to unmapped memory, or if a bus error occurs during `reset()`, the CPU enters the halted state. Moira calls the `didHaltCPU()` delegate, and `isHalted()` returns true. While halted, `execute()` only advances the clock. Only `reset()` leaves this state.
 
 ## Observing Bus Errors
 

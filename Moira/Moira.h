@@ -426,7 +426,9 @@ public:
      * and the debugger are reset. Then, the initial supervisor stack pointer
      * and the initial program counter are read from addresses 0 and 4 (via
      * read16OnReset()), and the prefetch queue is filled. Finally, the
-     * delegate didResetCPU() is called.
+     * delegate didResetCPU() is called. If a bus error occurs while the
+     * vectors are read or the prefetch queue is filled, the CPU halts
+     * afterwards and didHaltCPU() is called.
      *
      * The clock is not cleared. It keeps counting from its current value. Use
      * setClock() to change it.
@@ -480,9 +482,9 @@ public:
     /** @brief Checks if the CPU is in a HALT state
      *
      * The CPU halts if an unrecoverable error occurs, e.g., a bus error while
-     * processing a bus error. While halted, execute() only advances the clock.
-     * Only reset() leaves this state. The delegate didHaltCPU() is called when
-     * the CPU enters it.
+     * processing a bus error or during reset(). While halted, execute() only
+     * advances the clock. Only reset() leaves this state. The delegate
+     * didHaltCPU() is called when the CPU enters it.
      */
     bool isHalted() const { return flags & State::HALTED; }
 
