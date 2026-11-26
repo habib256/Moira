@@ -106,8 +106,8 @@ UAERef::skipSetup(const Setup &s) const
     }
 
     // [UAE] UAE takes an arithmetic exception of FMOVE to <ea> on the 68881 and 68882 right
-    // away, with a format 3 frame that only the 68040 knows. Moira reports it when the next
-    // FPU instruction starts, like all other arithmetic exceptions of these FPUs.
+    // away, with a format 3 frame that only the 68040 knows. Moira stacks the mid-instruction
+    // frame of these FPUs (format 9).
     if ((op & 0xFFC0) == 0xF200 && !tr().moiracpu->hasInternalFPU() && (s.fpcr & 0x7F00)) {
         u16 e = get16(mem, 0x1002);
         if ((e >> 13) == 3) return true;

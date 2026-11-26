@@ -922,16 +922,16 @@ Moira::execFMove(u16 opcode)
 
     if (cod == 0b011) {
 
-        // The 68040 takes an enabled exception right after a move to memory or to
-        // a data register (post-instruction exception). The 68881 and 68882 report
-        // it when the next FPU instruction starts, like all other exceptions.
-        if (auto vector = fpu.trapVector(); vector && hasInternalFPU()) {
+        // An enabled exception of a move to memory or to a data register is taken
+        // right after the operand has been stored. The 68040 takes it as a
+        // post-instruction exception. The 68881 and 68882 report it as a
+        // mid-instruction exception (MC68881/MC68882UM 6.1).
+        if (auto vector = fpu.trapVector()) {
 
             execFpuTrap<C>(vector, true, ea);
             FINALIZE
             return;
         }
-        fpu.pendingTrap = fpu.trapVector();
 
     } else {
 

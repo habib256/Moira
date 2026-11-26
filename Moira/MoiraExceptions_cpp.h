@@ -225,9 +225,30 @@ Moira::writeStackFrame1000(StackFrame &frame, u16 sr, u32 pc, u32 ia, u16 nr, u3
 }
 
 template <Core C> void
-Moira::writeStackFrame1001(u16 sr, u32 pc, u32 ia, u16 nr)
+Moira::writeStackFrame1001(u16 sr, u32 pc, u32 ia, u16 nr, u16 op, u32 ea)
 {
+    assert(C == Core::C68020);
 
+    // Effective address
+    push<C, Long>(ea);
+
+    // Operation word
+    push<C, Word>(op);
+
+    // Internal register
+    push<C, Word>(0);
+
+    // Program counter (address of the operation word)
+    push<C, Long>(ia);
+
+    // 1001 | Vector offset
+    push<C, Word>(0x9000 | nr << 2);
+
+    // Scan PC (address of the next instruction)
+    push<C, Long>(pc);
+
+    // Status register
+    push<C, Word>(sr);
 }
 
 template <Core C> void
@@ -746,16 +767,22 @@ Moira::execFpuTrap(u16 vector, bool post, u32 ea)
     // Inform the delegate
     willExecute(M68kException::FPU_ARITHMETIC, vector);
 
-    // Exceptions terminate loop mode and clear any pending trace event
-    flags &= ~(State::LOOPING | State::TRACE_EXC);
+    // Exceptions terminate loop mode and clear any pending trace event. The
+    // mid-instruction exception of the 68881 and 68882 is processed as part of
+    // the FMOVE, like a TRAP: the trace stays pending and is taken before the
+    // handler starts (MC68030UM 8.1.7, Table 8-6)
+    flags &= ~State::LOOPING;
+    if (!post || hasInternalFPU()) flags &= ~State::TRACE_EXC;
 
     // Enter supervisor mode and leave trace mode
     setSupervisorMode(true);
     clearTraceFlags();
 
     // Write stack frame
-    if (post) {
+    if (post && hasInternalFPU()) {
         writeStackFrame0011<C>(status, reg.pc, ea, vector);
+    } else if (post) {
+        writeStackFrame1001<C>(status, reg.pc, reg.pc0, vector, queue.ird, ea);
     } else {
         writeStackFrame0000<C>(status, reg.pc0, vector);
     }

@@ -474,8 +474,9 @@ TEST_CASE("FBcc and FDBcc to an odd target take an address error")
 /* Arithmetic exceptions (vectors 48 - 54). An exception that is enabled in
  * FPCR is not taken by the instruction that raises it. It is taken as a
  * pre-instruction exception when the next FPU instruction starts. BSUN is taken
- * before the conditional instruction completes. The 68040 takes an exception
- * of FMOVE to memory right away (post-instruction exception, format 3).
+ * before the conditional instruction completes. An exception of FMOVE to memory
+ * or to a data register is taken right away: the 68040 takes a post-instruction
+ * exception (format 3), the 68881 and 68882 a mid-instruction exception (format 9).
  */
 
 static void installFpuHandlers(TestCPU &cpu)
@@ -624,11 +625,214 @@ TEST_CASE("FMOVE to memory raises a post-instruction exception on the 68040")
         cpu.fpu.fpcr = FPEXP::OPERR;
         cpu.fpu.fpr[0] = MFloat80::quietNaN();
         cpu.reg.a[0] = 0x2000;
-        cpu.run({ 0xF210, 0x6000, 0xF280, 0x0000 }, 2);         // FMOVE.L FP0,(A0); FNOP
+        cpu.run({ 0xF210, 0x6000, 0xF280, 0x0000 });            // FMOVE.L FP0,(A0) traps before the FNOP
 
+        u32 sp = cpu.reg.sp;
         CHECK(cpu.reg.pc0 == fpuHandler(52));
-        CHECK(cpu.read16(cpu.reg.sp + 6) == 52 * 4);            // Format 0
-        CHECK(cpu.read32(cpu.reg.sp + 2) == TestCPU::codeStart + 4);
+        CHECK(cpu.read16(sp + 6) == (0x9000 | 52 * 4));         // Format 9
+        CHECK(cpu.read32(sp + 2) == TestCPU::codeStart + 4);    // Scan PC (next instruction)
+        CHECK(cpu.read32(sp + 8) == TestCPU::codeStart);        // Address of FMOVE
+        CHECK(cpu.read16(sp + 0x0E) == 0xF210);                 // Operation word
+        CHECK(cpu.read32(sp + 0x10) == 0x2000);                 // Effective address
+        CHECK(cpu.fpu.pendingTrap == 0);
+    }
+}
+
+/* The 68881 and 68882 store the operand of an FMOVE to memory or to a data
+ * register and then report an enabled SNAN, OPERR, OVFL, UNFL or INEX2
+ * exception as a mid-instruction exception (MC68881/MC68882UM 6.1.2 - 6.1.5,
+ * 6.1.7). The frame is format 9 (MC68881/MC68882UM 7.4.2.6, MC68030UM 10.4.19).
+ * RTE continues at the scan PC (MC68030UM 8.1.13).
+ */
+
+// Checks the format 9 frame on top of the supervisor stack
+static void checkMidFrame(TestCPU &cpu, u16 sr, u16 vector, u32 scanPC, u16 op)
+{
+    u32 sp = cpu.reg.sp;
+    CHECK(cpu.reg.pc0 == fpuHandler(vector));
+    CHECK(sp == 0x8000 - 20);
+    CHECK(cpu.read16(sp) == sr);                                // Status register
+    CHECK(cpu.read32(sp + 2) == scanPC);                        // Scan PC
+    CHECK(cpu.read16(sp + 6) == (0x9000 | vector * 4));         // Format 9
+    CHECK(cpu.read32(sp + 8) == TestCPU::codeStart);            // Address of FMOVE
+    CHECK(cpu.read16(sp + 0x0E) == op);                         // Operation word
+    CHECK(cpu.fpu.getFPIAR() == TestCPU::codeStart);
+    CHECK(cpu.fpu.pendingTrap == 0);
+}
+
+TEST_CASE("FMOVE to memory or to a data register raises a mid-instruction exception on the 6888x")
+{
+    SUBCASE("SNAN, OPERR, OVFL, UNFL and INEX2") {
+
+        struct Case { u16 vector; u32 enable; MFloat80 value; u16 ext; };
+
+        const Case cases[] = {
+
+            { 54, FPEXP::SIG_NAN, MFloat80::signalingNaN(), 0x6400 },   // FMOVE.S
+            { 52, FPEXP::OPERR,   MFloat80::infinity(),     0x6000 },   // FMOVE.L
+            { 53, FPEXP::OVFL,    F(1e300),                 0x6400 },   // FMOVE.S
+            { 51, FPEXP::UNFL,    F(1e-300),                0x6400 },   // FMOVE.S
+            { 49, FPEXP::INEX2,   F(0.1),                   0x6400 },   // FMOVE.S
+        };
+
+        for (auto model : { CPUModel::M68020, CPUModel::M68030 }) {
+            for (auto cp : { CPModel::M68881, CPModel::M68882 }) {
+                for (auto &c : cases) {
+
+                    // The result that is stored with the exception disabled
+                    TestCPU ref(cp, model);
+                    ref.fpu.fpr[0] = c.value;
+                    ref.reg.a[0] = 0x2000;
+                    ref.write32(0x2000, 0xFFFFFFFF);
+                    ref.reg.d[1] = 0xFFFFFFFF;
+                    ref.run({ 0xF210, c.ext });                     // FMOVE FP0,(A0)
+                    ref.run({ 0xF201, c.ext });                     // FMOVE FP0,D1
+                    REQUIRE(ref.read32(0x2000) != 0xFFFFFFFF);
+                    REQUIRE(ref.reg.d[1] != 0xFFFFFFFF);
+
+                    // To memory
+                    {
+                        TestCPU cpu(cp, model);
+                        installFpuHandlers(cpu);
+                        cpu.fpu.fpcr = c.enable;
+                        cpu.fpu.fpr[0] = c.value;
+                        cpu.reg.a[0] = 0x2000;
+                        cpu.write32(0x2000, 0xFFFFFFFF);
+                        cpu.run({ 0xF210, c.ext });                 // FMOVE FP0,(A0)
+
+                        CHECK(cpu.read32(0x2000) == ref.read32(0x2000));
+                        checkMidFrame(cpu, 0x2700, c.vector, TestCPU::codeStart + 4, 0xF210);
+                        CHECK(cpu.read32(cpu.reg.sp + 0x10) == 0x2000);
+                    }
+
+                    // To a data register (the effective address field is undefined)
+                    {
+                        TestCPU cpu(cp, model);
+                        installFpuHandlers(cpu);
+                        cpu.fpu.fpcr = c.enable;
+                        cpu.fpu.fpr[0] = c.value;
+                        cpu.reg.d[1] = 0xFFFFFFFF;
+                        cpu.run({ 0xF201, c.ext });                 // FMOVE FP0,D1
+
+                        CHECK(cpu.reg.d[1] == ref.reg.d[1]);
+                        checkMidFrame(cpu, 0x2700, c.vector, TestCPU::codeStart + 4, 0xF201);
+                    }
+                }
+            }
+        }
+    }
+
+    SUBCASE("Addressing modes") {
+
+        struct Case { std::initializer_list<u16> code; u32 scanPC; u32 ea; u32 a0; };
+
+        const Case cases[] = {
+
+            { { 0xF210, 0x6000 },                 4, 0x2000, 0x2000 },  // FMOVE.L FP0,(A0)
+            { { 0xF218, 0x6000 },                 4, 0x2000, 0x2004 },  // FMOVE.L FP0,(A0)+
+            { { 0xF220, 0x6000 },                 4, 0x1FFC, 0x1FFC },  // FMOVE.L FP0,-(A0)
+            { { 0xF228, 0x6000, 0x0010 },         6, 0x2010, 0x2000 },  // FMOVE.L FP0,($10,A0)
+            { { 0xF239, 0x6000, 0x0000, 0x3000 }, 8, 0x3000, 0x2000 },  // FMOVE.L FP0,($3000).L
+        };
+
+        for (auto model : { CPUModel::M68020, CPUModel::M68030 }) {
+            for (auto &c : cases) {
+
+                TestCPU cpu(CPModel::M68881, model);
+                installFpuHandlers(cpu);
+                cpu.fpu.fpcr = FPEXP::OPERR;
+                cpu.fpu.fpr[0] = MFloat80::infinity();
+                cpu.reg.a[0] = 0x2000;
+                cpu.run(c.code);
+
+                CHECK(cpu.read32(c.ea) == 0x7FFFFFFF);
+                CHECK(cpu.reg.a[0] == c.a0);
+                checkMidFrame(cpu, 0x2700, 52, TestCPU::codeStart + c.scanPC, *c.code.begin());
+                CHECK(cpu.read32(cpu.reg.sp + 0x10) == c.ea);
+            }
+        }
+    }
+
+    SUBCASE("A floating-point data register destination is not affected") {
+
+        // The register is not modified and the exception is taken when the next FPU
+        // instruction starts (MC68881/MC68882UM 6.1, 6.1.2)
+        TestCPU cpu;
+        installFpuHandlers(cpu);
+        cpu.fpu.fpcr = FPEXP::SIG_NAN;
+        cpu.fpu.fpr[0] = MFloat80::signalingNaN();
+        cpu.fpu.fpr[1] = F(1.0);
+        cpu.run({ 0xF200, 0x0080 });                            // FMOVE.X FP0,FP1
+
+        CHECK(cpu.pcOffset() == 4);
+        CHECK(cpu.fpu.pendingTrap == 54);
+        CHECK(same(cpu.fpu.fpr[1], F(1.0)));
+    }
+
+    SUBCASE("RTE continues with the next instruction") {
+
+        for (auto model : { CPUModel::M68020, CPUModel::M68030 }) {
+            for (u16 sr : { 0x2700, 0x0700 }) {
+
+                TestCPU cpu(CPModel::M68881, model);
+                installFpuHandlers(cpu);
+                cpu.write16(fpuHandler(52), 0x4E73);            // RTE
+                cpu.fpu.fpcr = FPEXP::OPERR;
+                cpu.fpu.fpr[0] = MFloat80::infinity();
+                cpu.reg.a[0] = 0x2000;
+                cpu.setSR(sr);
+                if (sr == 0x0700) cpu.reg.sp = 0x6000;          // User stack
+                u32 sp0 = cpu.reg.sp;
+
+                // FMOVE.L FP0,(A0); ADDQ.L #1,D1; FNOP
+                cpu.run({ 0xF210, 0x6000, 0x5281, 0xF280, 0x0000 });
+
+                checkMidFrame(cpu, sr, 52, TestCPU::codeStart + 4, 0xF210);
+                CHECK(cpu.reg.d[1] == 0);
+
+                cpu.execute();                                  // RTE
+                CHECK(cpu.reg.pc0 == TestCPU::codeStart + 4);
+                CHECK(cpu.getSR() == sr);
+                CHECK(cpu.reg.sp == sp0);
+
+                cpu.execute();                                  // ADDQ.L #1,D1
+                cpu.execute();                                  // FNOP
+                CHECK(cpu.reg.d[1] == 1);
+                CHECK(cpu.pcOffset() == 10);
+                CHECK(cpu.reg.sp == sp0);
+            }
+        }
+    }
+
+    SUBCASE("A traced FMOVE") {
+
+        // The trace exception is processed after the mid-instruction exception and
+        // before the first instruction of the handler, as after a TRAP (MC68030UM
+        // 8.1.7, Table 8-6)
+        for (auto model : { CPUModel::M68020, CPUModel::M68030 }) {
+
+            TestCPU cpu(CPModel::M68881, model);
+            installFpuHandlers(cpu);
+            cpu.write32(4 * 9, 0xA000);
+            cpu.write16(0xA000, 0x4E71);
+            cpu.fpu.fpcr = FPEXP::OPERR;
+            cpu.fpu.fpr[0] = MFloat80::infinity();
+            cpu.reg.a[0] = 0x2000;
+            cpu.setSR(0xA700);
+            cpu.run({ 0xF210, 0x6000 });                        // FMOVE.L FP0,(A0)
+
+            checkMidFrame(cpu, 0xA700, 52, TestCPU::codeStart + 4, 0xF210);
+            CHECK(cpu.getSR() == 0x2700);
+
+            cpu.execute();                                      // Trace exception
+            u32 sp = cpu.reg.sp;
+            CHECK(cpu.reg.pc0 == 0xA000);
+            CHECK(sp == 0x8000 - 20 - 12);
+            CHECK(cpu.read16(sp) == 0x2700);                    // Status register
+            CHECK(cpu.read32(sp + 2) == fpuHandler(52));        // Next instruction
+            CHECK(cpu.read16(sp + 6) == (0x2000 | 9 * 4));      // Format 2
+            CHECK(cpu.read32(sp + 8) == TestCPU::codeStart);    // Address of FMOVE
+        }
     }
 }
 
