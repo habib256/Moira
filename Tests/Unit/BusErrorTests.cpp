@@ -566,6 +566,109 @@ TEST_CASE("An instruction is restarted after a failing prefetch")
     }
 }
 
+/* A bus error while a trace exception is processed (stacking, vector fetch or
+ * the first fetches of the handler) is processed like any other bus error. Only
+ * a bus error while the bus error frame is stacked is a double bus fault.
+ */
+
+// NOP, traced in supervisor mode
+static void loadTracedNop(TestCPU &cpu, u32 isp)
+{
+    cpu.poke16(TestCPU::codeStart, 0x4E71);
+    cpu.poke16(TestCPU::codeStart + 2, 0x4E71);
+    cpu.poke16(TestCPU::codeStart + 4, 0x4E71);
+    cpu.debugger.jump(TestCPU::codeStart);
+    cpu.setSR(0xA700);
+    cpu.setISP(isp);
+}
+
+TEST_CASE("A bus error during trace exception processing is processed")
+{
+    for (auto model : { CPUModel::M68000, CPUModel::M68010, CPUModel::M68020,
+                        CPUModel::M68030, CPUModel::M68040 }) {
+
+        // The trace vector and the first word of the trace handler
+        for (u32 fault : { 0x24u, TestCPU::traceHandler }) {
+
+            CAPTURE(int(model));
+            CAPTURE(fault);
+
+            TestCPU cpu(model);
+            loadTracedNop(cpu, 0x1F00);
+            cpu.faultAddr = fault;
+
+            CHECK_NOTHROW(cpu.execute());               // NOP
+            CHECK_NOTHROW(cpu.execute());               // Trace exception
+
+            CHECK(!cpu.isHalted());
+            CHECK(cpu.getPC0() == TestCPU::handler);
+
+            // The 68000 is not processing an instruction (MC68000UM 6.3.9.1)
+            if (model == CPUModel::M68000) CHECK((cpu.peek16(cpu.getSP()) & 0x8) == 0x8);
+        }
+    }
+}
+
+TEST_CASE("An odd trace vector causes an address error")
+{
+    for (auto model : { CPUModel::M68000, CPUModel::M68010 }) {
+
+        CAPTURE(int(model));
+
+        TestCPU cpu(model);
+        cpu.poke32(0x24, TestCPU::traceHandler + 1);
+        loadTracedNop(cpu, 0x1F00);
+
+        CHECK_NOTHROW(cpu.execute());                   // NOP
+        CHECK_NOTHROW(cpu.execute());                   // Trace exception
+
+        CHECK(!cpu.isHalted());
+        CHECK(cpu.getPC0() == TestCPU::aeHandler);
+    }
+}
+
+TEST_CASE("A trace exception with an odd stack pointer halts the 68000")
+{
+    TestCPU cpu(CPUModel::M68000);
+    loadTracedNop(cpu, 0x1F01);
+
+    CHECK_NOTHROW(cpu.execute());                       // NOP
+    CHECK_NOTHROW(cpu.execute());                       // Trace exception
+
+    CHECK(cpu.isHalted());
+}
+
+// A system whose supervisor stack lies in a region that rejects every write
+class StacklessCPU : public TestCPU {
+
+public:
+
+    StacklessCPU(CPUModel model) : TestCPU(model) { }
+
+    void write16(u32 addr, u16 val) const override
+    {
+        if (addr >= 0x8000 && addr < 0x9000) throw BusError(addr);
+        TestCPU::write16(addr, val);
+    }
+};
+
+TEST_CASE("A bus error while the trace and the bus error frame are stacked halts the CPU")
+{
+    for (auto model : { CPUModel::M68000, CPUModel::M68010, CPUModel::M68020,
+                        CPUModel::M68030, CPUModel::M68040 }) {
+
+        CAPTURE(int(model));
+
+        StacklessCPU cpu(model);
+        loadTracedNop(cpu, 0x9000);
+
+        CHECK_NOTHROW(cpu.execute());                   // NOP
+        CHECK_NOTHROW(cpu.execute());                   // Trace exception
+
+        CHECK(cpu.isHalted());
+    }
+}
+
 TEST_SUITE_END();
 
 }

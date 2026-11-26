@@ -213,7 +213,14 @@ Moira::execute()
 
             // Process pending trace exception (if any)
             if (flags & TRACE_EXC) {
-                execException(M68kException::TRACE);
+
+                // Like a fault during interrupt processing, the fault is processed as a
+                // bus or address error. processException() halts if that one faults again.
+                try {
+                    execException(M68kException::TRACE);
+                } catch (const std::exception &exc) {
+                    processException(exc);
+                }
                 goto done;
             }
 

@@ -930,6 +930,18 @@ Moira::execException(M68kException exc, int nr)
             // Trace exceptions are taken at an instruction boundary
             reg.pc = reg.pc0;
 
+            // Write stack frame
+            if constexpr (C == Core::C68000) {
+
+                // MAME marks bus errors during the exception sequence as "not instruction" cycles
+                try {
+                    writeStackFrame0000<C>(status, reg.pc, vector);
+                    jumpToVector<C>(vector);
+                }
+                catch (BusError &e) { e.stackFrame.code |= 0x8; throw; }
+                break;
+            }
+
             // Write stack frame (the 68020 stacks the address of the traced instruction)
             if constexpr (C == Core::C68020) {
                 writeStackFrame0010<C>(status, reg.pc, reg.prev_pc0, vector);
